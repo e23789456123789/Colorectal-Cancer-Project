@@ -6,9 +6,6 @@ bowtie2 --very-sensitive-local --no-unal --no-mixed --no-discordant -p 20 -x ${I
 -2 ${id}_2_val_2.fq.gz \
 -S ${id}.sam \
 --un-conc ${id}>${id}.alignment.summary
-samtools view -S ${id}.sam -b -o ${id}.bam
-samtools sort ${id}.bam > ${id}_sort.bam
-samtools index ${id}_sort.bam
 java -jar picard.jar MarkDuplicates PG=null \
 VERBOSITY=ERROR \
 QUIET=true \
@@ -18,8 +15,6 @@ INPUT=${id}_sort.bam \
 OUTPUT=${id}_dedup.bam \
 METRICS_FILE=${id}_pe.markduplicates.log \
 VALIDATION_STRINGENCY=SILENT
-samtools view -h -F0x04 -q 30 ${id}_dedup.bam | grep -v chrM | samtools sort -o ${id}.rmchrM.bam
-samtools index -@ 8 ${id}.rmchrM.bam
 macs2 callpeak -t ${id}.rmchrM.bam \
 -n ${id} \
 -f BAMPE \
@@ -32,14 +27,6 @@ macs2 callpeak -t ${id}.rmchrM.bam \
 trim_galore -j 20 --phred33 -q 20 --length 8 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz ${id}_2.fq.gz
 bowtie2 -p 40 -x hg38_chr --very-sensitive --no-mixed --no-discordant -X 2000 -1 ${id}_1_val_1.fq.gz \
  	-2 ${id}_2_val_2.fq.gz 2>${id}.alignment.summary | samtools view -bS | samtools sort -@ 40 -o ${id}.sorted.bam
-samtools view -@ 40 -h -q 30 ${id}.sorted.bam | grep -v chrM | samtools sort -@ 40 -o ${id}.rmchrM.bam
-sambamba markdup --remove-duplicates --nthreads 8 ${id}.rmchrM.bam ${id}.rmDup.bam
-bedtools intersect -nonamecheck -v -abam ${id}.rmDup.bam -b hg38-blacklist.v2.bed > ${id}.tmp.bam
-samtools sort -@ 40  -o ${id}.bf.bam ${id}.tmp.bam
-samtools index -@ 40 ${id}.bf.bam
-alignmentSieve --numberOfProcessors 40 --ATACshift --blackListFileName hg38-blacklist.v2.bed --bam ${id}.bf.bam -o ${id}.shifted.bam
-samtools sort -@ 40 -o ${id}.shift.sorted.bam ${id}.shifted.bam
-samtools index -@ 40 ${id}.shift.sorted.bam
 java -jar picard.jar CollectInsertSizeMetrics I=${id}.shift.sorted.bam O=${id}_insert_size_metrics.txt H=${id}_insert_size_histogram.pdf M=0.5
 GSIZE="2913022398"
 bamCoverage -p 40 --outFileFormat bigwig --binSize 50 --normalizeUsing RPKM -b ${id}.shift.sorted.bam --effectiveGenomeSize ${GSIZE} -o ${id}.bw
@@ -52,10 +39,6 @@ bowtie2 -p 40 -q \
 		-x ${index} \
 		-1 ${id}.R1.clean.fq.gz \
 		-2 ${id}.R2.clean.fq.gz 2>${id}.alignment.summary | samtools view -F 4 -u - | samtools sort -@ 100 -o ${id}.bam -
-samtools view -b -f 2 -q 30 -@ 40 -o ${id}.f2.q30.bam ${id}.bam
-java -jar picard.jar  MarkDuplicates PG=null VERBOSITY=ERROR QUIET=true CREATE_INDEX=false REMOVE_DUPLICATES=true INPUT=${id}.f2.q30.bam OUTPUT=${id}_dedup.bam M=${id}_pe.markduplicates.log 
-samtools view -@ 40 -h ${id}_dedup.bam | grep -v 'MT' | samtools view -bS -o ${id}_final.bam
-
 #panel-seq
 ref=hg38.fa
 
@@ -106,8 +89,6 @@ java -Xmx16G -jar picard.jar SortSam \
 
 java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir FilterConsensusReads --input=${sample}.consensus.merge.querysorted.bam --output=${sample}.consensus.merge.filter.bam --ref=${ref} -M 2 -N 30 -q 20
 
-samtools sort ${sample}.consensus.merge.filter.bam > ${sample}_consensus_merge_filter_sorted.bam
-
 java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir ClipBam --input=${sample}.consensus.merge.filter.bam --output=${sample}.consensus.merge.filter.clip.bam --ref=${ref} --clip-overlapping-reads=true
 
 gatk BaseRecalibrator \
@@ -124,9 +105,6 @@ gatk ApplyBQSR \
 -bqsr ${sample}_recal.table \
 -O ${sample}_bqsr.bam \
 1>${sample}_log.ApplyBQSR 2>&1
-
-samtools sort -@ 40 -o ${sample}_bqsr_sorted.bam ${sample}_bqsr.bam
-samtools index -@ 40 ${sample}_bqsr_sorted.bam
 
 gatk Mutect2 \
   -R $ref \
