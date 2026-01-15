@@ -136,16 +136,13 @@ gatk Mutect2 \
   --panel-of-normals somatic-hg38_1000g_pon.hg38.vcf \
   -O ${sample}_raw_vcf.gz
 
-#突变过滤及位点注释.
 gatk FilterMutectCalls \
 -R $ref \
 -V ${sample}_raw_vcf \
 -O ${sample}_somatic.vcf
 
-#手动筛选及过滤.
 cat ${sample}_somatic.vcf | awk '{if($0~"#"){print $0}else if($7=="PASS"){print $0}}' > ${sample}_filter.vcf
 
-#构建索引.
 gatk IndexFeatureFile -I ${sample}_filter.vcf
 
 #Funcotator
@@ -160,3 +157,696 @@ gatk  Funcotator -R $ref \
 echo "end Funcotator for ${sample} " `date`
 
 #LC-WGS.
+step1:
+import os
+import numpy as np
+import pandas as pd
+import logging
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, cross_val_predict, cross_val_score
+)
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, precision_score, recall_score, 
+    f1_score, confusion_matrix, classification_report, roc_curve, auc
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.base import clone
+import seaborn as sns
+from matplotlib import rcParams
+from matplotlib.ticker import FormatStrFormatter
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['font.size'] = 12
+plt.rcParams['axes.linewidth'] = 1.2
+plt.rcParams['grid.linewidth'] = 0.8
+plt.rcParams['grid.alpha'] = 0.4
+plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['pdf.fonttype'] = 42  
+plt.rcParams['ps.fonttype'] = 42
+
+def preprocess_data(df, target_column):
+    df = df.drop(columns=['WhichSample'], errors='ignore')
+    y = df[target_column]
+    
+    if y.dtype == 'object' or y.dtype.name == 'category':
+        y = LabelEncoder().fit_transform(y)
+    
+    X = df.drop(columns=[target_column])
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
+    
+    non_numeric = X.select_dtypes(exclude=['number']).columns
+    if not non_numeric.empty:
+        raise ValueError(f"{list(non_numeric)}")
+    
+    return X.values, y, X.columns.tolist()
+
+def get_base_model_config():
+    return {
+        'short': ('xgboost', {
+            "n_estimators": 65,
+            "max_depth": 6,
+            "learning_rate": 0.14243977962263052,
+            "subsample": 0.59368123588652,
+            "colsample_bytree": 0.9734409813049573,
+            "min_child_weight": 1,
+            'random_state': SEED
+        }),
+        'motif': ('randomforest', {
+            'n_estimators': 233,
+            'max_depth': 10,
+            'min_samples_split': 2,
+            'random_state': SEED
+        }),
+        'griffin': ('xgboost', {
+            'n_estimators': 248,
+            'max_depth': 9,
+            'learning_rate': 0.03499213226852467,
+            'subsample': 0.812843418636107,
+            'colsample_bytree': 0.9479154121602775,
+            'min_child_weight': 1,
+            'random_state': SEED
+        }),
+        'cnv': ('logistic', {
+            'C': 3.681633921421882,
+            'penalty': 'l2',
+            'solver': 'liblinear',
+            'random_state': SEED
+        })
+    }
+
+def initialize_model(model_type, params):
+    if model_type == 'logistic':
+        return LogisticRegression(**params)
+    elif model_type == 'randomforest':
+        return RandomForestClassifier(**params)
+    elif model_type == 'xgboost':
+        return XGBClassifier(**params)
+    else:
+        raise ValueError(f"{model_type}")
+
+
+def generate_meta_features(base_models, dfs_dict, target_column, use_cv=True):
+    meta_features = []
+    for name, model in base_models.items():
+        feature_type = name.split('_')[0]
+        X, y, _ = preprocess_data(dfs_dict[feature_type], target_column)
+        
+        if use_cv:
+            preds = cross_val_predict(
+                clone(model), X, y,
+                cv=StratifiedKFold(5, shuffle=True, random_state=SEED),
+                method='predict_proba',
+                n_jobs=-1
+            )[:, 1]
+        else:
+            model.fit(X, y)
+            preds = model.predict_proba(X)[:, 1]
+            
+        meta_features.append(preds)
+        logger.info(f"{name}, 均值={np.mean(preds):.4f}")
+    
+    return np.column_stack(meta_features)
+
+def train_meta_model(X, y):
+    model = XGBClassifier(
+        n_estimators=150,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        eval_metric='logloss',
+        random_state=SEED
+    )
+    
+    scores = cross_val_score(
+        model, X, y, 
+        cv=StratifiedKFold(5, shuffle=True, random_state=SEED),
+        scoring='roc_auc',
+        n_jobs=-1
+    )
+    logger.info(f" {np.mean(scores):.4f}±{np.std(scores):.4f}")
+    
+    model.fit(X, y)
+    return model
+
+def calculate_auc_ci(y_true, y_proba, n_bootstraps=1000, confidence_level=0.95):
+    """
+    """
+    bootstrapped_auc = []
+    n_samples = len(y_true)
+    
+    for _ in range(n_bootstraps):
+        indices = np.random.randint(0, n_samples, n_samples)
+        if len(np.unique(y_true[indices])) < 2:
+            continue
+            
+        auc_val = roc_auc_score(y_true[indices], y_proba[indices])
+        bootstrapped_auc.append(auc_val)
+    
+    mean_auc = np.mean(bootstrapped_auc)
+    ci_low = np.percentile(bootstrapped_auc, (1 - confidence_level) * 50)
+    ci_high = np.percentile(bootstrapped_auc, (1 + confidence_level) * 50)
+    
+    return mean_auc, ci_low, ci_high
+
+def plot_roc_curves(y_train, y_proba_train, y_test, y_proba_test, output_dir):
+    """
+
+    """
+    plt.figure(figsize=(9, 8))
+    ax = plt.gca()
+    
+    fpr_train, tpr_train, _ = roc_curve(y_train, y_proba_train)
+    roc_auc_train, ci_low_train, ci_high_train = calculate_auc_ci(y_train, y_proba_train)
+    specificity_train = 1 - fpr_train
+    
+    fpr_test, tpr_test, _ = roc_curve(y_test, y_proba_test)
+    roc_auc_test, ci_low_test, ci_high_test = calculate_auc_ci(y_test, y_proba_test)
+    specificity_test = 1 - fpr_test
+    
+    plt.plot(
+        specificity_train, 
+        tpr_train, 
+        color='#696969', 
+        linestyle='-', 
+        lw=2.0,
+        alpha=0.9,
+        label=f'Train AUC = {roc_auc_train:.3f} ({ci_low_train:.3f}-{ci_high_train:.3f})'
+    )
+    
+    plt.plot(
+        specificity_test, 
+        tpr_test, 
+        color='#1E90FF', 
+        linestyle='-', 
+        lw=2.0,
+        alpha=0.9,
+        label=f'Valid AUC = {roc_auc_test:.3f} ({ci_low_test:.3f}-{ci_high_test:.3f})'
+    )
+    
+    plt.plot([0, 1], [0, 1], color='#000000', lw=1.5, linestyle='--', alpha=0.5)
+    
+    plt.title('Cancer cohort v.s. Healthy cohort', fontsize=14, fontweight='bold')
+    plt.xlabel('Specificity', fontsize=12)
+    plt.ylabel('Sensitivity', fontsize=12)
+    
+    plt.xlim([1.1, -0.1]) 
+    plt.ylim([-0.05, 1.05]) 
+    
+    plt.xticks(np.arange(0.0, 1.1, 0.2), fontsize=10)
+    plt.yticks(np.arange(0.0, 1.1, 0.2), fontsize=10)
+    
+    plt.grid(True, linestyle='-', alpha=0.15)
+    
+    legend = plt.legend(loc="lower left", frameon=True, fontsize=10)
+    legend.get_frame().set_alpha(0.95)
+    legend.get_frame().set_edgecolor('#E0E0E0')
+    
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.2)
+    
+    roc_path = os.path.join(output_dir, 'roc_curves.pdf')
+    plt.savefig(roc_path, dpi=300, bbox_inches='tight', pad_inches=0.1)
+    
+    png_path = os.path.join(output_dir, 'roc_curves.png')
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    
+    plt.close()
+    
+    return roc_auc_train, ci_low_train, ci_high_train, roc_auc_test, ci_low_test, ci_high_test
+
+def evaluate_model(model, X, y, prefix='', output_dir='.'):
+    y_pred = model.predict(X)
+    y_proba = model.predict_proba(X)[:, 1]
+    
+    metrics = {
+        'accuracy': accuracy_score(y, y_pred),
+        'roc_auc': roc_auc_score(y, y_proba),
+        'precision': precision_score(y, y_pred),
+        'recall': recall_score(y, y_pred),
+        'f1': f1_score(y, y_pred)
+    }
+    
+    roc_auc, ci_low, ci_high = calculate_auc_ci(y, y_proba)
+    
+    logger.info(f"{prefix}: "
+                f"AUC={roc_auc:.4f} ({ci_low:.4f}-{ci_high:.4f}), "
+                f"Accuracy={metrics['accuracy']:.4f}, "
+                f"Precision={metrics['precision']:.4f}, "
+                f"Recall={metrics['recall']:.4f}, "
+                f"F1={metrics['f1']:.4f}")
+    
+    report = classification_report(y, y_pred, output_dict=True)
+    report_df = pd.DataFrame(report).transpose()
+    report_path = os.path.join(output_dir, f"{prefix}_classification_report.csv")
+    report_df.to_csv(report_path)
+    
+    return metrics, roc_auc, ci_low, ci_high, y_proba
+
+def plot_feature_importance(model, feature_names, output_path):
+    if hasattr(model, 'feature_importances_'):
+        importance = model.feature_importances_
+    elif hasattr(model, 'coef_'):
+        importance = np.abs(model.coef_[0])
+    else:
+        return
+    
+    plt.figure(figsize=(8, 6))
+    idx = np.argsort(importance)
+    plt.barh(np.array(feature_names)[idx], importance[idx], color='#4C72B0', alpha=0.9)
+    
+    plt.xlabel("Importance Score", fontsize=12)
+    plt.ylabel("Meta Features", fontsize=12)
+    plt.title("Meta Feature Importance", fontsize=14, fontweight='bold')
+    
+    ax = plt.gca()
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.2)
+    
+    plt.tight_layout()
+    
+    pdf_path = os.path.splitext(output_path)[0] + '.pdf'
+    plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def run_stacking_pipeline(input_files, target_column, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    dfs = {}
+    for f in input_files:
+        fname = os.path.basename(f).lower()
+        if 'short' in fname or 'merged' in fname:
+            key = 'short'
+        elif 'motif' in fname:
+            key = 'motif'
+        elif 'griffin' in fname:
+            key = 'griffin'
+        elif 'cnv' in fname:
+            key = 'cnv'
+        else:
+            raise ValueError(f"{fname}")
+        dfs[key] = pd.read_csv(f)
+    
+    ref_df = dfs['short']
+    train_idx, test_idx = train_test_split(
+        np.arange(len(ref_df)),
+        test_size=0.2,
+        stratify=ref_df[target_column],
+        random_state=SEED
+    )
+    
+    train_dfs = {k: df.iloc[train_idx] for k, df in dfs.items()}
+    test_dfs = {k: df.iloc[test_idx] for k, df in dfs.items()}
+    
+    base_models = {}
+    model_config = get_base_model_config()
+    for feature_type, (model_type, params) in model_config.items():
+        X_train, y_train, _ = preprocess_data(train_dfs[feature_type], target_column)
+        model = initialize_model(model_type, params)
+        model.fit(X_train, y_train)
+        base_models[f"{feature_type}_{model_type}"] = model
+        
+        y_pred = model.predict(X_train)
+        y_proba = model.predict_proba(X_train)[:, 1]
+        base_auc = roc_auc_score(y_train, y_proba)
+    
+    X_stack_train = generate_meta_features(base_models, train_dfs, target_column, use_cv=True)
+    X_stack_test = generate_meta_features(base_models, test_dfs, target_column, use_cv=False)
+    
+    y_train = train_dfs['short'][target_column].values
+    y_test = test_dfs['short'][target_column].values
+    
+    meta_model = train_meta_model(X_stack_train, y_train)
+    
+    train_metrics, train_auc, train_ci_low, train_ci_high, train_y_proba = evaluate_model(
+        meta_model, X_stack_train, y_train, 'train', output_dir
+    )
+    
+    test_metrics, test_auc, test_ci_low, test_ci_high, test_y_proba = evaluate_model(
+        meta_model, X_stack_test, y_test, 'test', output_dir
+    )
+    
+
+    plot_roc_curves(
+        y_train, train_y_proba,
+        y_test, test_y_proba,
+        output_dir
+    )
+    
+    model_path = os.path.join(output_dir, 'stacking_model.pkl')
+    joblib.dump(
+        {'base_models': base_models, 'meta_model': meta_model},
+        model_path
+    )
+    logger.info(f"{model_path}")
+
+    feature_importance_path = os.path.join(output_dir, 'meta_feature_importance.png')
+    plot_feature_importance(
+        meta_model, 
+        list(base_models.keys()), 
+        feature_importance_path
+    )
+    
+    metrics_df = pd.DataFrame({
+        'train': {
+            'accuracy': train_metrics['accuracy'],
+            'roc_auc': train_auc,
+            'roc_auc_ci': f"({train_ci_low:.4f}-{train_ci_high:.4f})",
+            'precision': train_metrics['precision'],
+            'recall': train_metrics['recall'],
+            'f1': train_metrics['f1']
+        },
+        'test': {
+            'accuracy': test_metrics['accuracy'],
+            'roc_auc': test_auc,
+            'roc_auc_ci': f"({test_ci_low:.4f}-{test_ci_high:.4f})",
+            'precision': test_metrics['precision'],
+            'recall': test_metrics['recall'],
+            'f1': test_metrics['f1']
+        }
+    })
+    
+    metrics_path = os.path.join(output_dir, 'performance_metrics.csv')
+    metrics_df.to_csv(metrics_path)
+
+# ===================== 主执行 =====================
+if __name__ == '__main__':
+    input_files = [
+        'merged_data.csv',
+        'sig_motif.csv',
+        'sig_Griffin.csv',
+        'sig_CNV.csv'
+    ]
+    
+    try:
+        run_stacking_pipeline(
+            input_files=input_files,
+            target_column='WhichGroup',
+            output_dir='./stacking_results1'
+        )
+    except Exception as e:
+        logger.error(f"{str(e)}", exc_info=True)
+        raise
+
+
+step2:
+import os
+import numpy as np
+import pandas as pd
+import logging
+import joblib
+from copy import deepcopy
+
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, cross_val_predict
+)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
+from sklearn.base import clone
+
+from sklearn.ensemble import RandomForestClassifier 
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+import matplotlib.pyplot as plt
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger("STACKING_REPRO")
+
+TARGET_SENS = 0.95 
+
+INPUT_FILES = {
+    "griffin": "sig_Griffin.csv",
+    "cnv": "sig_CNV.csv",
+    "motif": "sig_motif.csv",
+    "merged": "merged_data.csv"
+}
+
+TARGET = "WhichGroup"
+OUTDIR = f"stacking_final_seed_{BEST_SEED}"
+
+def preprocess(df, target):
+    df = df.drop(columns=["WhichSample"], errors="ignore")
+    df = df.dropna()
+    y = df[target]
+    if y.dtype == "object":
+        y = LabelEncoder().fit_transform(y)
+    X = df.drop(columns=[target])
+    return X.values, y
+
+def init_model(model_type, params):
+    params = params.copy()
+    if model_type == "xgboost":
+        if 'use_label_encoder' not in params: params['use_label_encoder'] = False
+        if 'eval_metric' not in params: params['eval_metric'] = 'logloss'
+        return XGBClassifier(**params)
+    elif model_type == "lightgbm":
+        return LGBMClassifier(**params)
+    elif model_type == "randomforest":
+        return RandomForestClassifier(**params)
+    elif model_type == "logistic":
+        return LogisticRegression(**params)
+    else:
+        raise ValueError(model_type)
+
+def find_threshold_at_target_sensitivity(y_true, y_prob, target_sens=0.90):
+    """
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    idx = np.argmax(tpr >= target_sens)
+    return thresholds[idx]
+
+def compute_metrics(y_true, y_prob, threshold):
+    y_pred = (y_prob >= threshold).astype(int)
+    try:
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    except ValueError:
+        return 0, 0 
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    return sens, spec
+
+def bootstrap_ci(y_true, y_prob, metric_fn, threshold, n_bootstrap=2000, seed=56):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    rng = np.random.RandomState(seed)
+    stats = []
+    N = len(y_true)
+    for _ in range(n_bootstrap):
+        idx = rng.choice(N, N, replace=True)
+        if metric_fn == roc_auc_score:
+            stats.append(metric_fn(y_true[idx], y_prob[idx]))
+        else:
+            stats.append(metric_fn(y_true[idx], y_prob[idx], threshold=threshold))
+    return np.percentile(stats, 2.5), np.percentile(stats, 97.5)
+
+def plot_roc(y_train, p_train, y_valid, p_valid, y_test, p_test):
+    plt.figure(figsize=(7, 6))
+    for name, yt, yp in [
+        ("Train", y_train, p_train),
+        ("Valid", y_valid, p_valid),
+        ("Test", y_test, p_test)
+    ]:
+        fpr, tpr, _ = roc_curve(yt, yp)
+        auc = roc_auc_score(yt, yp)
+        plt.plot(fpr, tpr, label=f"{name} AUC={auc:.3f}")
+    plt.plot([0,1],[0,1],'k--')
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title(f"Stacking ROC Curves (Seed {BEST_SEED})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "final_roc_curve.pdf"), format='pdf', dpi=300)
+    plt.close()
+
+def get_model_config(current_seed):
+    """
+    """
+    return {
+        # === Griffin ===
+        "griffin_xgboost": ("xgboost", {
+            "n_estimators": 296,
+            "max_depth": 5,
+            "learning_rate": 0.021185654625092348,
+            "subsample": 0.5738962378152621,
+            "colsample_bytree": 0.5258908208982553,
+            "min_child_weight": 1,
+            'random_state': current_seed
+        }),
+        "griffin_lightgbm": ("lightgbm", {
+            "n_estimators": 122,
+            "max_depth": 10,
+            "learning_rate": 0.1654588886882512,
+            "subsample": 0.9722567336924554,
+            "colsample_bytree": 0.7794274363372442,
+            "num_leaves": 62,
+            'random_state': current_seed
+        }),
+
+        # === CNV ===
+        "cnv_logistic": ("logistic", {
+            'C': 6.132523028222041, 'penalty': 'l2', 'solver': 'liblinear', 'random_state': current_seed
+        }),
+        "cnv_rf": ("randomforest", {
+            "n_estimators": 409,
+            "max_depth": 4,
+            "min_samples_split": 18,
+            "min_samples_leaf": 9, 'random_state': current_seed
+        }),
+
+        # === Motif ===
+        "motif_lightgbm": ('lightgbm', {
+            "n_estimators": 480,
+            "max_depth": 10,
+            "learning_rate": 0.2668432075503721,
+            "subsample": 0.7749663835800096,
+            "colsample_bytree": 0.7011937667259128,
+            "num_leaves": 19, 'random_state': current_seed
+        }),
+        "motif_randomforest": ("randomforest", {
+            "n_estimators": 488,
+            "max_depth": 14,
+            "min_samples_split": 2,
+            "min_samples_leaf": 2, 'random_state': current_seed
+        }),
+
+        # === Merged ===
+        "merged_xgboost": ("xgboost", {
+            "n_estimators": 65, "max_depth": 6, "learning_rate": 0.14243977962263052, "subsample": 0.59368123588652,"colsample_bytree": 0.9734409813049573,"min_child_weight": 1,'random_state': current_seed
+        }),
+        "merged_randomforest": ("randomforest", {
+            'n_estimators': 109, 'max_depth': 6, 'min_samples_split': 3, 'min_samples_leaf': 10, 'random_state': current_seed
+        })
+    }
+
+def run_stacking_fixed():
+    os.makedirs(OUTDIR, exist_ok=True)
+
+    np.random.seed(BEST_SEED)
+
+    dfs = {k: pd.read_csv(path) for k, path in INPUT_FILES.items()}
+
+    ref = dfs["merged"]
+    idx_all = np.arange(len(ref))
+    train_idx, temp_idx = train_test_split(
+        idx_all, test_size=0.4, stratify=ref[TARGET], random_state=BEST_SEED
+    )
+    valid_idx, test_idx = train_test_split(
+        temp_idx, test_size=0.5, 
+        stratify=ref[TARGET].iloc[temp_idx], random_state=BEST_SEED
+    )
+
+    logger.info(f"Train={len(train_idx)}, Valid={len(valid_idx)}, Test={len(test_idx)}")
+
+    meta_train = []
+    meta_valid = []
+    meta_test = []
+    
+    model_config = get_model_config(BEST_SEED)
+
+    for full_key, (model_type, params) in model_config.items():
+        data_key = full_key.split('_')[0]
+        df = dfs[data_key]
+        logger.info(f"Generating Meta-Features: {full_key}")
+
+        X_train, y_train_full = preprocess(df.iloc[train_idx], TARGET)
+        X_valid, y_valid_full = preprocess(df.iloc[valid_idx], TARGET)
+        X_test, y_test_full = preprocess(df.iloc[test_idx], TARGET)
+        
+        base = init_model(model_type, params)
+        base.fit(X_train, y_train_full)
+
+        oof = cross_val_predict(
+            clone(base),
+            X_train, y_train_full,
+            cv=StratifiedKFold(5, shuffle=True, random_state=BEST_SEED),
+            method="predict_proba"
+        )[:, 1]
+
+        meta_train.append(oof)
+        meta_valid.append(base.predict_proba(X_valid)[:, 1])
+        meta_test.append(base.predict_proba(X_test)[:, 1])
+
+    X_meta_train = np.column_stack(meta_train)
+    X_meta_valid = np.column_stack(meta_valid)
+    X_meta_test = np.column_stack(meta_test)
+    
+    y_train = preprocess(dfs["merged"].iloc[train_idx], TARGET)[1]
+    y_valid = preprocess(dfs["merged"].iloc[valid_idx], TARGET)[1]
+    y_test = preprocess(dfs["merged"].iloc[test_idx], TARGET)[1]
+
+    logger.info(f"Meta-features shape: {X_meta_train.shape}")
+
+    logger.info("Training Final Meta-Learner (Random Forest)...")
+    
+    final_meta_model = RandomForestClassifier(
+        n_estimators=200, 
+        max_depth=6, 
+        min_samples_split=5,
+        min_samples_leaf=2,
+        max_features='sqrt',
+        random_state=BEST_SEED, 
+        n_jobs=-1
+    )
+
+    X_full = np.vstack([X_meta_train, X_meta_valid])
+    y_full = np.concatenate([y_train, y_valid])
+    
+    final_meta_model.fit(X_full, y_full)
+    
+    p_train = final_meta_model.predict_proba(X_meta_train)[:, 1]
+    p_valid = final_meta_model.predict_proba(X_meta_valid)[:, 1] 
+    p_test = final_meta_model.predict_proba(X_meta_test)[:, 1]
+
+    final_test_auc = roc_auc_score(y_test, p_test)
+    logger.info(f"Reproduced Test AUC: {final_test_auc:.4f}")
+
+    plot_roc(y_train, p_train, y_valid, p_valid, y_test, p_test)
+
+    best_threshold = find_threshold_at_target_sensitivity(y_valid, p_valid, target_sens=TARGET_SENS)
+
+    results = {}
+    for split, yt, yp in [
+        ("train", y_train, p_train),
+        ("valid", y_valid, p_valid),
+        ("test", y_test, p_test)
+    ]:
+        auc = roc_auc_score(yt, yp)
+        sens, spec = compute_metrics(yt, yp, threshold=best_threshold) 
+
+        results[split] = {
+            "AUC": auc,
+            "AUC_CI": bootstrap_ci(yt, yp, roc_auc_score, threshold=best_threshold),
+            "Sensitivity": sens,
+            "Sensitivity_CI": bootstrap_ci(yt, yp, 
+                                           lambda a, b, threshold: compute_metrics(a, b, threshold)[0], 
+                                           threshold=best_threshold),
+            "Specificity": spec,
+            "Specificity_CI": bootstrap_ci(yt, yp, 
+                                           lambda a, b, threshold: compute_metrics(a, b, threshold)[1], 
+                                           threshold=best_threshold),
+        }
+
+    pd.DataFrame(results).to_csv(os.path.join(OUTDIR, "final_metrics_report.csv"))
+    joblib.dump(final_meta_model, os.path.join(OUTDIR, "final_model_reproduced.pkl"))
+
+    logger.info("Done! Results saved.")
+
+if __name__ == "__main__":
+    run_stacking_fixed()
