@@ -255,7 +255,6 @@ def initialize_model(model_type, params):
     else:
         raise ValueError(f"{model_type}")
 
-
 def generate_meta_features(base_models, dfs_dict, target_column, use_cv=True):
     meta_features = []
     for name, model in base_models.items():
@@ -542,7 +541,6 @@ def run_stacking_pipeline(input_files, target_column, output_dir):
     metrics_path = os.path.join(output_dir, 'performance_metrics.csv')
     metrics_df.to_csv(metrics_path)
 
-# ===================== 主执行 =====================
 if __name__ == '__main__':
     input_files = [
         'merged_data.csv',
@@ -560,7 +558,6 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"{str(e)}", exc_info=True)
         raise
-
 
 step2:
 import os
