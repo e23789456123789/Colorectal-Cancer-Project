@@ -1,0 +1,162 @@
+#CUT&RUN analysis.
+trim_galore -j 15 -q 20 --phred33 --length 25 -e 0.1 --max_n 3 --stringency 3 -o . --paired ${id}_1.fq.gz ${id}_2.fq.gz
+INDEX=
+bowtie2 --very-sensitive-local --no-unal --no-mixed --no-discordant -p 20 -x ${INDEX} --phred33 -I 10 -X 700 \
+-1 ${id}_1_val_1.fq.gz \
+-2 ${id}_2_val_2.fq.gz \
+-S ${id}.sam \
+--un-conc ${id}>${id}.alignment.summary
+samtools view -S ${id}.sam -b -o ${id}.bam
+samtools sort ${id}.bam > ${id}_sort.bam
+samtools index ${id}_sort.bam
+java -jar picard.jar MarkDuplicates PG=null \
+VERBOSITY=ERROR \
+QUIET=true \
+CREATE_INDEX=false \
+REMOVE_DUPLICATES=false \
+INPUT=${id}_sort.bam \
+OUTPUT=${id}_dedup.bam \
+METRICS_FILE=${id}_pe.markduplicates.log \
+VALIDATION_STRINGENCY=SILENT
+samtools view -h -F0x04 -q 30 ${id}_dedup.bam | grep -v chrM | samtools sort -o ${id}.rmchrM.bam
+samtools index -@ 8 ${id}.rmchrM.bam
+macs2 callpeak -t ${id}.rmchrM.bam \
+-n ${id} \
+-f BAMPE \
+-g 2913022398 \
+-p 1e-10 \
+--keep-dup all \
+--outdir .
+
+#ATAC-seq
+trim_galore -j 20 --phred33 -q 20 --length 8 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz ${id}_2.fq.gz
+bowtie2 -p 40 -x hg38_chr --very-sensitive --no-mixed --no-discordant -X 2000 -1 ${id}_1_val_1.fq.gz \
+ 	-2 ${id}_2_val_2.fq.gz 2>${id}.alignment.summary | samtools view -bS | samtools sort -@ 40 -o ${id}.sorted.bam
+samtools view -@ 40 -h -q 30 ${id}.sorted.bam | grep -v chrM | samtools sort -@ 40 -o ${id}.rmchrM.bam
+sambamba markdup --remove-duplicates --nthreads 8 ${id}.rmchrM.bam ${id}.rmDup.bam
+bedtools intersect -nonamecheck -v -abam ${id}.rmDup.bam -b hg38-blacklist.v2.bed > ${id}.tmp.bam
+samtools sort -@ 40  -o ${id}.bf.bam ${id}.tmp.bam
+samtools index -@ 40 ${id}.bf.bam
+alignmentSieve --numberOfProcessors 40 --ATACshift --blackListFileName hg38-blacklist.v2.bed --bam ${id}.bf.bam -o ${id}.shifted.bam
+samtools sort -@ 40 -o ${id}.shift.sorted.bam ${id}.shifted.bam
+samtools index -@ 40 ${id}.shift.sorted.bam
+java -jar picard.jar CollectInsertSizeMetrics I=${id}.shift.sorted.bam O=${id}_insert_size_metrics.txt H=${id}_insert_size_histogram.pdf M=0.5
+GSIZE="2913022398"
+bamCoverage -p 40 --outFileFormat bigwig --binSize 50 --normalizeUsing RPKM -b ${id}.shift.sorted.bam --effectiveGenomeSize ${GSIZE} -o ${id}.bw
+
+#MeDIP
+trim_galore -j 8 --phred33 -q 20 --length 8 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz ${id}_2.fq.gz
+fastp -g -i ${id}_1_val_1.fq.gz -I ${id}_2_val_2.fq.gz -o ${id}.R1.clean.fq.gz -O ${id}.R2.clean.fq.gz 
+index=""
+bowtie2 -p 40 -q \
+		-x ${index} \
+		-1 ${id}.R1.clean.fq.gz \
+		-2 ${id}.R2.clean.fq.gz 2>${id}.alignment.summary | samtools view -F 4 -u - | samtools sort -@ 100 -o ${id}.bam -
+samtools view -b -f 2 -q 30 -@ 40 -o ${id}.f2.q30.bam ${id}.bam
+java -jar picard.jar  MarkDuplicates PG=null VERBOSITY=ERROR QUIET=true CREATE_INDEX=false REMOVE_DUPLICATES=true INPUT=${id}.f2.q30.bam OUTPUT=${id}_dedup.bam M=${id}_pe.markduplicates.log 
+samtools view -@ 40 -h ${id}_dedup.bam | grep -v 'MT' | samtools view -bS -o ${id}_final.bam
+
+#panel-seq
+ref=hg38.fa
+
+#snp=dbsnp_138.hg38.vcf
+indel=Mills_and_1000G_gold_standard.indels.hg38.vcf
+
+seqkit fx2tab -j 80 ${sample}_${i}.fq.gz | awk '{print $1"\t"substr($3,1,7)}' | LC_ALL=C grep -F -w -f $umi4 - | cut -f1 > ${sample}.4.$i
+seqkit fx2tab -j 80 ${sample}_${i}.fq.gz | awk '{print $1"\t"substr($3,1,5)}' | LC_ALL=C grep -F -w -f $umi2 - | cut -f1 > ${sample}.2.$i
+
+seqkit grep -j 80 -f ${sample}.2.$i ${sample}_${i}.fq.gz | awk '{if(NR%4==2) print "AA"$0;else if(NR%4==0) print "FF"$0;else print $0}' > ${sample}.R${i}.fq
+seqkit grep -j 80 -f ${sample}.4.$i ${sample}_${i}.fq.gz >> ${sample}.R${i}.fq
+done
+
+cat ${sample}.2.* ${sample}.4.* | sort | uniq -d > ${sample}.12
+seqkit grep -j 80 -f ${sample}.12 ${sample}.R1.fq | paste - - - - | sort -k1,1 | tr '\t' '\n' | gzip > ${sample}_clean_1.fq.gz
+seqkit grep -j 80 -f ${sample}.12 ${sample}.R2.fq | paste - - - - | sort -k1,1 | tr '\t' '\n' | gzip > ${sample}_clean_2.fq.gz
+
+java -Xmx16G -jar picard.jar FastqToSam F1=${sample}_clean_1.fq.gz F2=${sample}_clean_2.fq.gz PL=illumina SM=${sample} LB=${sample}_lib RG=${sample}_rg O=${sample}.ubam TMP_DIR=$tmp_dir
+
+java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir ExtractUmisFromBam -i ${sample}.ubam -o ${sample}.umi.pe5.uBAM -r 4M3S+T 4M3S+T -s RX -t ZA ZB
+
+samtools fastq ${sample}.umi.pe5.uBAM |bwa mem -t 8 -p ${ref} /dev/stdin | samtools view -b > ${sample}.umi.pe5.bam
+
+java -Xmx16G -jar picard.jar MergeBamAlignment R=${ref} UNMAPPED_BAM=${sample}.umi.pe5.uBAM ALIGNED_BAM=${sample}.umi.pe5.bam O=${sample}.umi.merge.bam ATTRIBUTES_TO_RETAIN=XS SO=coordinate TMP_DIR=$tmp_dir 
+
+java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir GroupReadsByUmi --input=${sample}.umi.merge.bam --output=${sample}.umi.group.bam --strategy=paired --edits=0 -m 20 
+
+java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir CallMolecularConsensusReads -M 1 -m 20 --input=${sample}.umi.group.bam --output=${sample}.consensus.ubam
+
+samtools fastq ${sample}.consensus.ubam |bwa mem -Y -t 8 -p ${ref} /dev/stdin |samtools view -b > ${sample}.consensus.bam
+
+java -Xmx16G -jar picard.jar SortSam \
+    I=${sample}.consensus.bam \
+    O=${sample}.consensus.querysorted.bam \
+    SORT_ORDER=queryname
+
+java -Xmx16G -jar picard.jar SortSam \
+    I=${sample}.consensus.ubam \
+    O=${sample}.consensus.querysorted.ubam \
+    SORT_ORDER=queryname
+
+java -Xmx16G -jar picard.jar MergeBamAlignment R=${ref} UNMAPPED_BAM=${sample}.consensus.querysorted.ubam ALIGNED_BAM=${sample}.consensus.querysorted.bam O=${sample}.consensus.merge.bam ATTRIBUTES_TO_RETAIN=XS SO=coordinate TMP_DIR=$tmp_dir
+
+java -Xmx16G -jar picard.jar SortSam \
+    I=${sample}.consensus.merge.bam \
+    O=${sample}.consensus.merge.querysorted.bam \
+    SORT_ORDER=queryname
+
+java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir FilterConsensusReads --input=${sample}.consensus.merge.querysorted.bam --output=${sample}.consensus.merge.filter.bam --ref=${ref} -M 2 -N 30 -q 20
+
+samtools sort ${sample}.consensus.merge.filter.bam > ${sample}_consensus_merge_filter_sorted.bam
+
+java -Xmx16G -jar fgbio.jar --tmp-dir=$tmp_dir ClipBam --input=${sample}.consensus.merge.filter.bam --output=${sample}.consensus.merge.filter.clip.bam --ref=${ref} --clip-overlapping-reads=true
+
+gatk BaseRecalibrator \
+-R $ref \
+-I ${sample}.consensus.merge.filter.clip.bam \
+--known-sites $indel \
+--known-sites 1000G_phase1.snps.high_confidence.hg38.vcf \
+-O ${sample}_recal.table \
+1>${sample}_log.recal 2>&1
+
+gatk ApplyBQSR \
+-R $ref \
+-I ${sample}.consensus.merge.filter.clip.bam \
+-bqsr ${sample}_recal.table \
+-O ${sample}_bqsr.bam \
+1>${sample}_log.ApplyBQSR 2>&1
+
+samtools sort -@ 40 -o ${sample}_bqsr_sorted.bam ${sample}_bqsr.bam
+samtools index -@ 40 ${sample}_bqsr_sorted.bam
+
+gatk Mutect2 \
+  -R $ref \
+  -I ${sample}_bqsr_sorted.bam 
+  --tumor-sample ${sample} \
+  --germline-resource af-only-gnomad.hg38.vcf \
+  --panel-of-normals somatic-hg38_1000g_pon.hg38.vcf \
+  -O ${sample}_raw_vcf.gz
+
+#突变过滤及位点注释.
+gatk FilterMutectCalls \
+-R $ref \
+-V ${sample}_raw_vcf \
+-O ${sample}_somatic.vcf
+
+#手动筛选及过滤.
+cat ${sample}_somatic.vcf | awk '{if($0~"#"){print $0}else if($7=="PASS"){print $0}}' > ${sample}_filter.vcf
+
+#构建索引.
+gatk IndexFeatureFile -I ${sample}_filter.vcf
+
+#Funcotator
+source=funcotator_dataSources.v1.8.hg38.20230908s
+echo "start Funcotator for ${sample} " `date`
+gatk  Funcotator -R $ref \
+-V ${sample}_filter.vcf \
+-O ${sample}_funcotator.tmp.maf \
+--data-sources-path ${source} \
+--output-file-format MAF \
+--ref-version hg38
+echo "end Funcotator for ${sample} " `date`
+
+#LC-WGS.
