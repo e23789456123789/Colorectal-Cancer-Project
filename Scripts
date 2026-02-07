@@ -1,4 +1,4 @@
-#CUT&RUN analysis.
+#1.CUT&RUN analysis.
 trim_galore -j 15 -q 20 --phred33 --length 25 -e 0.1 --max_n 3 --stringency 3 -o . --paired ${id}_1.fq.gz ${id}_2.fq.gz
 INDEX=
 bowtie2 --very-sensitive-local --no-unal --no-mixed --no-discordant -p 20 -x ${INDEX} --phred33 -I 10 -X 700 \
@@ -23,7 +23,7 @@ macs2 callpeak -t ${id}.rmchrM.bam \
 --keep-dup all \
 --outdir .
 
-#ATAC-seq
+#2.ATAC-seq
 trim_galore -j 20 --phred33 -q 20 --length 8 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz ${id}_2.fq.gz
 bowtie2 -p 40 -x hg38_chr --very-sensitive --no-mixed --no-discordant -X 2000 -1 ${id}_1_val_1.fq.gz \
  	-2 ${id}_2_val_2.fq.gz 2>${id}.alignment.summary | samtools view -bS | samtools sort -@ 40 -o ${id}.sorted.bam
@@ -39,7 +39,7 @@ bowtie2 -p 40 -q \
 		-x ${index} \
 		-1 ${id}.R1.clean.fq.gz \
 		-2 ${id}.R2.clean.fq.gz 2>${id}.alignment.summary | samtools view -F 4 -u - | samtools sort -@ 100 -o ${id}.bam -
-#panel-seq
+#3.panel-seq
 ref=hg38.fa
 
 #snp=dbsnp_138.hg38.vcf
@@ -134,7 +134,7 @@ gatk  Funcotator -R $ref \
 --ref-version hg38
 echo "end Funcotator for ${sample} " `date`
 
-#LC-WGS.
+#4.LC-WGS.
 step1:
 import os
 import numpy as np
